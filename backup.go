@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -72,13 +71,34 @@ func collectFileTar(path string, info os.FileInfo, err error) error {
 	if err != nil {
 		return err
 	}
-	if info.Mode()&os.ModeSocket != 0 {
-		// ignore sockets
+	
+	// Skip special files that can cause issues
+	if info.Mode()&os.ModeSocket != 0 || 
+	   info.Mode()&os.ModeNamedPipe != 0 ||
+	   info.Mode()&os.ModeDevice != 0 {
 		return nil
 	}
 
 	if optVerbose {
 		fmt.Println("Adding", path)
+	}
+
+	// Handle symlinks by getting the actual file info
+	actualPath := path
+	if info.Mode()&os.ModeSymlink != 0 {
+		// Resolve symlink to get the actual file
+		linkPath, err := os.Readlink(path)
+		if err != nil {
+			return err
+		}
+		if !filepath.IsAbs(linkPath) {
+			linkPath = filepath.Join(filepath.Dir(path), linkPath)
+		}
+		actualPath = linkPath
+		info, err = os.Stat(actualPath)
+		if err != nil {
+			return err
+		}
 	}
 
 	th, err := tar.FileInfoHeader(info, path)
@@ -96,20 +116,24 @@ func collectFileTar(path string, info os.FileInfo, err error) error {
 		return err
 	}
 
+	// Only copy content for regular files
 	if !info.Mode().IsRegular() {
 		return nil
 	}
-	if info.Mode().IsDir() {
-		return nil
-	}
 
-	file, err := os.Open(path)
+	file, err := os.Open(actualPath)
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 
-	_, err = io.Copy(tw, file)
-	return err
+	// Use CopyN to ensure we only copy the exact number of bytes specified in the header
+	_, err = io.CopyN(tw, file, info.Size())
+	if err != nil && err != io.EOF {
+		return err
+	}
+
+	return nil
 }
 
 func backupTar(filename string, backup Backup) error {
@@ -117,13 +141,15 @@ func backupTar(filename string, backup Backup) error {
 	if err != nil {
 		return err
 	}
-	// fmt.Println(string(b))
 
 	tarfile, err := os.Create(filename + ".tar")
 	if err != nil {
 		return err
 	}
+	defer tarfile.Close()
+	
 	tw = tar.NewWriter(tarfile)
+	defer tw.Close()
 
 	th := &tar.Header{
 		Name:       "container.json",
@@ -142,50 +168,41 @@ func backupTar(filename string, backup Backup) error {
 	}
 
 	for _, m := range backup.Mounts {
-		// fmt.Printf("Mount (type %s) %s -> %s\n", m.Type, m.Source, m.Destination)
-
 		err := filepath.Walk(m.Source, collectFileTar)
 		if err != nil {
-			return err
+			fmt.Printf("Warning: Error walking path %s: %v\n", m.Source, err)
+			continue
 		}
 	}
 
-	tw.Close()
 	fmt.Println("Created backup:", filename+".tar")
 	return nil
 }
 
 func getFullImageName(imageName string) (string, error) {
-	// If the image already specifies a tag we can safely use as-is
 	if strings.Contains(imageName, ":") {
 		return imageName, nil
 	}
 
-	// If the used image doesn't include tag information try to find one (if it exists).
 	images, err := cli.ImageList(ctx, types.ImageListOptions{})
 	if err != nil {
-		// Couldn't get image list, abort
 		return imageName, err
 	}
 
 	for _, image := range images {
-		if (!strings.Contains(imageName, image.ID)) || len(image.RepoTags) == 0 {
-			// unrelated image or image entry doesn't have any tags, move on
+		if !strings.Contains(imageName, image.ID) || len(image.RepoTags) == 0 {
 			continue
 		}
 
 		for _, tag := range image.RepoTags {
-			// use closer matching tag if it exists
 			if !strings.Contains(tag, imageName) {
 				continue
 			}
 			return tag, nil
 		}
-		// If none of the tags matches the base image name, return the first tag
 		return image.RepoTags[0], nil
 	}
 
-	// There is no tag on the matching image, just have to go with what was provided
 	return imageName, nil
 }
 
@@ -220,18 +237,17 @@ func backup(ID string) error {
 	if err != nil {
 		return err
 	}
-	// fmt.Println(string(b))
 
-	err = ioutil.WriteFile(filename+".backup.json", b, 0600)
+	err = os.WriteFile(filename+".backup.json", b, 0600)
 	if err != nil {
 		return err
 	}
 
 	for _, m := range conf.Mounts {
-		// fmt.Printf("Mount (type %s) %s -> %s\n", m.Type, m.Source, m.Destination)
 		err := filepath.Walk(m.Source, collectFile)
 		if err != nil {
-			return err
+			fmt.Printf("Warning: Error walking path %s: %v\n", m.Source, err)
+			continue
 		}
 	}
 
@@ -274,13 +290,14 @@ func backupAll() error {
 		All: optStopped,
 	})
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	for _, container := range containers {
 		err := backup(container.ID)
 		if err != nil {
-			return err
+			fmt.Printf("Warning: Failed to backup container %s: %v\n", container.ID, err)
+			continue
 		}
 	}
 
